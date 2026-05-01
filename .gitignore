@@ -1,0 +1,49 @@
+# Python cache / test artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python packaging / virtualenvs
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# DemoLens generated artifacts
+.demolens_csda/
+temp_csda_*/
+tmp_csda_*/
+*_out/
+*_output/
+demo_meta.json
+players.json
+kills.json
+diagnostics.json
+ticks.jsonl
+ticks.parquet
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# data
+data/
+
+# tests
+tests/
