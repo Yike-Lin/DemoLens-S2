@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10,7 +11,12 @@ from typing import Any, Dict, Optional, Sequence
 
 import pandas as pd
 
-from ..errors import EntityNotFoundError, ParseFailedError, UnsupportedPatchError
+from ..errors import (
+    DemoLensError,
+    EntityNotFoundError,
+    ParseFailedError,
+    UnsupportedPatchError,
+)
 from .demoparser2_backend import Demoparser2Backend
 
 
@@ -26,17 +32,46 @@ class _CsdaCache:
 class CsDemoAnalyzerBackend(object):
     name = "cs-demo-analyzer"
     version = "1.9.5"
+    supported_sources = (
+        "challengermode",
+        "ebot",
+        "esea",
+        "esl",
+        "esplay",
+        "esportal",
+        "faceit",
+        "fastcup",
+        "5eplay",
+        "gamersclub",
+        "matchzy",
+        "perfectworld",
+        "popflash",
+        "pracc",
+        "renown",
+        "valve",
+    )
+    _five_e_signature = re.compile(rb"5e_[0-9]{4}", re.IGNORECASE)
 
-    def __init__(self, executable_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        executable_path: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
         self._legacy = Demoparser2Backend()
         self._workspace_root = Path(__file__).resolve().parents[2]
         self._scratch_root = self._workspace_root / ".demolens_csda"
         self._scratch_root.mkdir(parents=True, exist_ok=True)
         self._executable_path = self._resolve_executable(executable_path)
+        self._preferred_source = self._normalize_source(
+            source or os.environ.get("DEMOLENS_DEMO_SOURCE")
+        )
         self._cache: Dict[str, _CsdaCache] = {}
+        self._header_cache: Dict[str, Dict[str, Any]] = {}
 
     def parse_header(self, demo_path: str) -> Dict[str, Any]:
-        return self._legacy.parse_header(demo_path)
+        header = self._legacy.parse_header(demo_path)
+        self._header_cache[str(Path(demo_path).resolve())] = dict(header)
+        return header
 
     def parse_players(self, demo_path: str) -> pd.DataFrame:
         legacy = self._try_legacy_parse(lambda: self._legacy.parse_players(demo_path))
@@ -162,6 +197,8 @@ class CsDemoAnalyzerBackend(object):
 
     def _ensure_csda_cache(self, demo_path: str, stage: str) -> _CsdaCache:
         cache_key = str(Path(demo_path).resolve())
+        if self._preferred_source is not None:
+            cache_key = "%s::%s" % (cache_key, self._preferred_source)
         if cache_key in self._cache:
             return self._cache[cache_key]
         if self._executable_path is None:
@@ -171,16 +208,51 @@ class CsDemoAnalyzerBackend(object):
                 {"demo_path": demo_path, "workspace_root": str(self._workspace_root)},
             )
 
+        cache = self._run_csda(demo_path, stage, forced_source=self._preferred_source)
+        self._cache[cache_key] = cache
+        return cache
+
+    def _run_csda(
+        self,
+        demo_path: str,
+        stage: str,
+        forced_source: Optional[str] = None,
+    ) -> _CsdaCache:
+        last_exc: Optional[DemoLensError] = None
+        try:
+            return self._run_single_csda(demo_path, stage, forced_source=forced_source)
+        except DemoLensError as exc:
+            if forced_source is not None:
+                raise
+            if not self._is_unknown_source_failure(exc):
+                raise
+            last_exc = exc
+        for candidate_source in self._source_attempts(demo_path):
+            try:
+                return self._run_single_csda(
+                    demo_path, stage, forced_source=candidate_source
+                )
+            except DemoLensError as candidate_exc:
+                last_exc = candidate_exc
+
+        if last_exc is not None:
+            raise last_exc
+        raise ParseFailedError(
+            stage,
+            "cs-demo-analyzer failed to infer demo source",
+            {"demo_path": demo_path},
+        )
+
+    def _run_single_csda(
+        self,
+        demo_path: str,
+        stage: str,
+        forced_source: Optional[str] = None,
+    ) -> _CsdaCache:
         output_dir = Path(
             tempfile.mkdtemp(prefix="demolens_csda_", dir=str(self._scratch_root))
         )
-        cmd = [
-            str(self._executable_path),
-            f"-demo-path={demo_path}",
-            f"-output={str(output_dir)}",
-            "-format=csdm",
-            "-positions",
-        ]
+        cmd = self._build_csda_command(demo_path, output_dir, forced_source)
         completed = subprocess.run(
             cmd,
             capture_output=True,
@@ -191,31 +263,170 @@ class CsDemoAnalyzerBackend(object):
         )
         if completed.returncode != 0:
             shutil.rmtree(output_dir, ignore_errors=True)
-            self._raise_csda_failure(stage, demo_path, cmd, completed)
+            self._raise_csda_failure(
+                stage,
+                demo_path,
+                cmd,
+                completed,
+                forced_source=forced_source,
+            )
 
         try:
             stem = Path(demo_path).stem
-            demo_info = self._load_demo_info(self._require_file(output_dir, f"{stem}_demo.csv", stage))
-            positions = self._load_positions(self._require_file(output_dir, f"{stem}_positions.csv", stage))
-            shots = self._load_shots(self._require_file(output_dir, f"{stem}_shots.csv", stage))
-            kills = self._load_kills(self._require_file(output_dir, f"{stem}_kills.csv", stage))
-            rounds = self._load_rounds(self._require_file(output_dir, f"{stem}_rounds.csv", stage))
+            demo_info = self._load_demo_info(
+                self._require_file(output_dir, f"{stem}_demo.csv", stage)
+            )
+            positions = self._load_positions(
+                self._require_file(output_dir, f"{stem}_positions.csv", stage)
+            )
+            shots = self._load_shots(
+                self._require_file(output_dir, f"{stem}_shots.csv", stage)
+            )
+            kills = self._load_kills(
+                self._require_file(output_dir, f"{stem}_kills.csv", stage)
+            )
+            rounds = self._load_rounds(
+                self._require_file(output_dir, f"{stem}_rounds.csv", stage)
+            )
         except Exception:
             shutil.rmtree(output_dir, ignore_errors=True)
             raise
 
         shutil.rmtree(output_dir, ignore_errors=True)
-        cache = _CsdaCache(
+        if forced_source is not None and not demo_info.get("source"):
+            demo_info["source"] = forced_source
+        return _CsdaCache(
             demo_info=demo_info,
             positions=positions,
             shots=shots,
             kills=kills,
             rounds=rounds,
         )
-        self._cache[cache_key] = cache
-        return cache
 
-    def _raise_csda_failure(self, stage: str, demo_path: str, cmd: Sequence[str], completed) -> None:
+    def _build_csda_command(
+        self,
+        demo_path: str,
+        output_dir: Path,
+        forced_source: Optional[str] = None,
+    ) -> Sequence[str]:
+        cmd = [
+            str(self._executable_path),
+            f"-demo-path={demo_path}",
+            f"-output={str(output_dir)}",
+            "-format=csdm",
+            "-positions",
+        ]
+        if forced_source is not None:
+            cmd.append(f"-source={forced_source}")
+        return cmd
+
+    def _source_attempts(self, demo_path: str) -> Sequence[str]:
+        header = self._header_for_demo(demo_path)
+        candidates = []
+
+        header_source = self._guess_source_from_header(header)
+        if header_source is not None:
+            candidates.append(header_source)
+
+        sniffed_source = self._sniff_source_from_demo(demo_path)
+        if sniffed_source is not None:
+            candidates.append(sniffed_source)
+
+        server_name = str(header.get("server_name") or "").strip().lower()
+        game_directory = str(header.get("game_directory") or "").strip().lower()
+        if server_name == "counter-strike 2" and "steamcmd" in game_directory:
+            candidates.extend(["5eplay", "valve"])
+
+        candidates.extend(["perfectworld", "5eplay", "valve"])
+        return self._dedupe_sources(candidates)
+
+    def _header_for_demo(self, demo_path: str) -> Dict[str, Any]:
+        cache_key = str(Path(demo_path).resolve())
+        if cache_key in self._header_cache:
+            return self._header_cache[cache_key]
+        try:
+            header = dict(self._legacy.parse_header(demo_path))
+        except Exception:
+            header = {}
+        self._header_cache[cache_key] = header
+        return header
+
+    def _guess_source_from_header(
+        self, header: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        if not header:
+            return None
+        server_name = str(header.get("server_name") or "").strip().lower()
+        if "\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0" in server_name:
+            return "perfectworld"
+        if "perfectworld" in server_name or "perfect world" in server_name:
+            return "perfectworld"
+        if "5eplay" in server_name:
+            return "5eplay"
+        return None
+
+    def _sniff_source_from_demo(self, demo_path: str) -> Optional[str]:
+        overlap = b""
+        try:
+            with open(demo_path, "rb") as fp:
+                while True:
+                    chunk = fp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    payload = overlap + chunk
+                    if self._five_e_signature.search(payload):
+                        return "5eplay"
+                    overlap = payload[-32:]
+        except OSError:
+            return None
+        return None
+
+    @classmethod
+    def _dedupe_sources(cls, values: Sequence[str]) -> Sequence[str]:
+        result = []
+        seen = set()
+        for value in values:
+            source = cls._normalize_source(value)
+            if source is None or source in seen:
+                continue
+            seen.add(source)
+            result.append(source)
+        return result
+
+    @classmethod
+    def _normalize_source(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        source = str(value).strip().lower()
+        if not source:
+            return None
+        if source not in cls.supported_sources:
+            raise ValueError("unsupported demo source: %s" % value)
+        return source
+
+    @staticmethod
+    def _is_unknown_source_failure(exc: DemoLensError) -> bool:
+        message = " ".join(
+            [
+                exc.failure_reason,
+                str(exc.details.get("stdout", "")),
+                str(exc.details.get("stderr", "")),
+            ]
+        ).lower()
+        return (
+            "unknown demo source" in message
+            or "unknownsource" in message
+            or "specify the source with the -source flag" in message
+        )
+
+    def _raise_csda_failure(
+        self,
+        stage: str,
+        demo_path: str,
+        cmd: Sequence[str],
+        completed,
+        forced_source: Optional[str] = None,
+    ) -> None:
         message = "\n".join(
             [part for part in (completed.stdout.strip(), completed.stderr.strip()) if part]
         ).strip()
@@ -223,6 +434,7 @@ class CsDemoAnalyzerBackend(object):
         details = {
             "demo_path": demo_path,
             "command": list(cmd),
+            "forced_source": forced_source,
             "exit_code": completed.returncode,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
@@ -296,9 +508,12 @@ class CsDemoAnalyzerBackend(object):
         row = pd.read_csv(path, header=None, names=names, encoding="utf-8").iloc[0].to_dict()
         return {
             "checksum": row.get("checksum"),
+            "source": row.get("source"),
             "tickrate": float(row.get("tickrate") or 64.0),
             "map_name": row.get("map_name"),
             "server_name": row.get("server_name"),
+            "client_name": row.get("client_name"),
+            "game_directory": row.get("game_directory"),
             "network_protocol": row.get("network_protocol"),
         }
 
