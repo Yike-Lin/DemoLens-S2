@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .backends.csda_backend import CsDemoAnalyzerBackend
 from .exporters import export_result
 from .pipeline import DemoLensExtractor
 
@@ -24,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="jsonl",
         help="Output format for per-tick player state",
     )
+    parser.add_argument(
+        "--source",
+        choices=["auto", *CsDemoAnalyzerBackend.supported_sources],
+        default="auto",
+        help="Force cs-demo-analyzer demo source when auto detection is unreliable",
+    )
     return parser
 
 
@@ -31,7 +38,10 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     demo_path = Path(args.demo)
     output_dir = args.output_dir or str(demo_path.parent / (demo_path.stem + "_out"))
-    extractor = DemoLensExtractor()
+    backend = CsDemoAnalyzerBackend(
+        source=None if args.source == "auto" else args.source
+    )
+    extractor = DemoLensExtractor(backend=backend)
     result = extractor.extract(str(demo_path))
     paths = export_result(result, output_dir, ticks_format=args.ticks_format)
     print(json.dumps(paths, ensure_ascii=False, indent=2))
